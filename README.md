@@ -93,6 +93,17 @@ The same model architecture, training configuration, and hyperparameters are use
 Although both methods achieve similar final accuracy on this dataset, MIGT demonstrates more stable training–validation convergence and a principled, reproducible dataset partitioning strategy.
 
 ---
+## Training Curves
+
+The following figures show the training and validation performance of the Xception model using MIGT and Random dataset splits.
+
+### MIGT Split
+<img width="846" height="393" alt="MIGT" src="https://github.com/user-attachments/assets/362c0892-ead8-4e70-b128-f8b52eaa2bfd" />
+
+### Random Split
+<img width="846" height="393" alt="Random" src="https://github.com/user-attachments/assets/caa4c354-35f1-45bb-af14-14ad686cc66b" />
+
+---
 
 ## Repository Structure
 ```bash
