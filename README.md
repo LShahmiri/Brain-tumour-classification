@@ -1,4 +1,4 @@
-# Brain Tumor Classification: MIGT vs Random
+# Brain Tumour Classification: MIGT vs Random
 
 This repository presents a brain tumor classification framework based on an Xception CNN and compares two dataset partitioning strategies:
 - Random split (baseline)
@@ -9,7 +9,7 @@ The goal is to evaluate the effect of information-aware dataset splitting on tra
 ---
 
 ## Dataset
-- Classes: Brain Tumor, Healthy
+- Classes: Brain Tumour, Healthy
 - Image size: 224 × 224
 - Total samples: ~4,500 MRI images
 - Split ratio:
