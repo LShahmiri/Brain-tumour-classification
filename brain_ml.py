@@ -130,6 +130,8 @@ print("    └── Healthy/")
 # End of Script
 # ============================================================
 
+"""## Train Model with Random"""
+
 # ============================================================
 # Brain Tumor Classification (Tumor vs Healthy) using Xception
 # Pretrained on ImageNet (Transfer Learning + Fine-Tuning)
@@ -189,6 +191,473 @@ FINE_TUNE_EPOCHS = 20         # additional epochs after head training
 
 # Model save paths (Drive)
 SAVE_DIR = "/content/drive/MyDrive/DATASETS/model-saved/random-save"
+os.makedirs(SAVE_DIR, exist_ok=True)
+BASE_MODEL_H5 = os.path.join(SAVE_DIR, "xception_base_model.h5")
+FULL_MODEL_H5 = os.path.join(SAVE_DIR, "xception_full_model.h5")
+BEST_MODEL_H5 = os.path.join(SAVE_DIR, "xception_best_model.h5")
+
+# -------------------- Safety Checks --------------------
+for d in [TRAIN_DIR, VAL_DIR, TEST_DIR]:
+    if not os.path.isdir(d):
+        raise FileNotFoundError(
+            f"Missing folder: {d}\n\n"
+            "Expected structure:\n"
+            "BASE_DIR/train/<class_name>/...\n"
+            "BASE_DIR/val/<class_name>/...\n"
+            "BASE_DIR/test/<class_name>/...\n"
+        )
+
+# -------------------- Load Datasets --------------------
+train_ds = tf.keras.utils.image_dataset_from_directory(
+    TRAIN_DIR,
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="binary"  # returns labels as 0/1
+)
+
+val_ds = tf.keras.utils.image_dataset_from_directory(
+    VAL_DIR,
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="binary"
+)
+
+test_ds = tf.keras.utils.image_dataset_from_directory(
+    TEST_DIR,
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="binary",
+    shuffle=False  # IMPORTANT for correct ROC/CM alignment
+)
+
+class_names = train_ds.class_names
+print("Class names:", class_names)
+# Example: ['Brain Tumor', 'Healthy'] or ['Healthy', 'Brain Tumor']
+# We'll respect this order everywhere.
+
+# -------------------- Performance: Cache/Prefetch --------------------
+AUTOTUNE = tf.data.AUTOTUNE
+train_ds = train_ds.shuffle(1000, seed=SEED).prefetch(AUTOTUNE)
+val_ds = val_ds.prefetch(AUTOTUNE)
+test_ds = test_ds.prefetch(AUTOTUNE)
+
+# -------------------- Data Augmentation --------------------
+data_augmentation = keras.Sequential(
+    [
+        layers.RandomFlip("horizontal"),
+        layers.RandomRotation(0.10),
+        layers.RandomZoom(0.15),
+        layers.RandomContrast(0.10),
+    ],
+    name="data_augmentation"
+)
+
+# Xception preprocess (ImageNet)
+preprocess_input = tf.keras.applications.xception.preprocess_input
+
+# -------------------- Build Model --------------------
+base_model = tf.keras.applications.Xception(
+    weights="imagenet",
+    include_top=False,
+    input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3)
+)
+
+# Freeze base model for the first stage (train only the head)
+base_model.trainable = False
+
+inputs = keras.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+x = data_augmentation(inputs)
+x = preprocess_input(x)
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dropout(0.3)(x)
+outputs = layers.Dense(1, activation="sigmoid")(x)
+
+model = keras.Model(inputs, outputs, name="xception_brain_tumor")
+
+# -------------------- Compile (Stage 1: Train Head) --------------------
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=HEAD_LR),
+    loss="binary_crossentropy",
+    metrics=[
+        "accuracy",
+        tf.keras.metrics.AUC(name="auc")
+    ]
+)
+
+model.summary()
+
+# -------------------- Callbacks --------------------
+callbacks = [
+    keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=PATIENCE,
+        restore_best_weights=True
+    ),
+    keras.callbacks.ModelCheckpoint(
+        filepath=BEST_MODEL_H5,
+        monitor="val_loss",
+        save_best_only=True
+    )
+]
+
+# -------------------- Train (Stage 1) --------------------
+history_head = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=callbacks
+)
+
+# -------------------- Fine-Tuning (Stage 2) --------------------
+history_ft = None
+if DO_FINE_TUNE:
+    # Unfreeze last N layers (keep BatchNorm frozen for stability)
+    base_model.trainable = True
+
+    # Freeze all layers first
+    for layer in base_model.layers:
+        layer.trainable = False
+
+    # Unfreeze last N layers except BatchNorm
+    for layer in base_model.layers[-FINE_TUNE_LAYERS:]:
+        if isinstance(layer, layers.BatchNormalization):
+            layer.trainable = False
+        else:
+            layer.trainable = True
+
+    # Re-compile with a smaller learning rate
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=FINE_TUNE_LR),
+        loss="binary_crossentropy",
+        metrics=[
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc")
+        ]
+    )
+
+    print("\nStarting fine-tuning...\n")
+    history_ft = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=FINE_TUNE_EPOCHS,
+        callbacks=callbacks
+    )
+
+# -------------------- Save Models (.h5) --------------------
+# Save base model (feature extractor) and full model (end-to-end classifier)
+base_model.save(BASE_MODEL_H5)
+model.save(FULL_MODEL_H5)
+print(f"Saved base model: {BASE_MODEL_H5}")
+print(f"Saved full model: {FULL_MODEL_H5}")
+print(f"Best checkpoint (val_loss): {BEST_MODEL_H5}")
+
+# -------------------- Combine History (for plotting) --------------------
+def merge_histories(h1, h2):
+    """Merge two Keras History objects (head + fine-tune) into one dict."""
+    out = {}
+    for k in h1.history.keys():
+        out[k] = list(h1.history[k])
+    if h2 is not None:
+        for k in h2.history.keys():
+            out[k].extend(list(h2.history[k]))
+    return out
+
+hist = merge_histories(history_head, history_ft)
+
+# -------------------- Plot Training Curves --------------------
+plt.figure(figsize=(10, 4))
+
+# Loss
+plt.plot(hist["loss"], label="Train Loss")
+plt.plot(hist["val_loss"], label="Val Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Training vs Validation Loss")
+plt.legend()
+plt.show()
+
+plt.figure(figsize=(10, 4))
+# Accuracy
+plt.plot(hist["accuracy"], label="Train Accuracy")
+plt.plot(hist["val_accuracy"], label="Val Accuracy")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.title("Training vs Validation Accuracy")
+plt.legend()
+plt.show()
+
+# -------------------- Evaluate on Test Set --------------------
+test_loss, test_acc, test_auc = model.evaluate(test_ds, verbose=1)
+print(f"\nTest Loss: {test_loss:.4f}")
+print(f"Test Accuracy: {test_acc:.4f}")
+print(f"Test AUC: {test_auc:.4f}\n")
+
+# -------------------- Predictions for Confusion Matrix / ROC --------------------
+y_true = []
+y_prob = []
+
+for x_batch, y_batch in test_ds:
+    probs = model.predict(x_batch, verbose=0).reshape(-1)
+    y_prob.extend(probs.tolist())
+    y_true.extend(y_batch.numpy().astype(int).reshape(-1).tolist())
+
+y_true = np.array(y_true)
+y_prob = np.array(y_prob)
+
+# Default threshold (paper can also report best threshold using ROC if needed)
+threshold = 0.5
+y_pred = (y_prob >= threshold).astype(int)
+
+# -------------------- Confusion Matrix --------------------
+cm = confusion_matrix(y_true, y_pred)
+
+plt.figure(figsize=(5, 4))
+plt.imshow(cm)
+plt.title("Confusion Matrix (Test Set)")
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+plt.xticks([0, 1], class_names, rotation=20)
+plt.yticks([0, 1], class_names)
+
+# Put numbers in cells
+for i in range(2):
+    for j in range(2):
+        plt.text(j, i, str(cm[i, j]), ha="center", va="center")
+
+plt.colorbar()
+plt.show()
+
+print("Classification Report (Test Set):")
+print(classification_report(y_true, y_pred, target_names=class_names))
+
+# -------------------- ROC Curve --------------------
+fpr, tpr, _ = roc_curve(y_true, y_prob)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(6, 5))
+plt.plot(fpr, tpr, label=f"ROC curve (AUC = {roc_auc:.4f})")
+plt.plot([0, 1], [0, 1], linestyle="--", label="Random baseline")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve (Test Set)")
+plt.legend()
+plt.show()
+
+# -------------------- One Example Inference --------------------
+# Take 1 batch from test set
+for images, labels in test_ds.take(1):
+    img = images[0]
+    true_label = int(labels[0].numpy())
+
+    prob = float(model.predict(tf.expand_dims(img, 0), verbose=0)[0][0])
+    pred_label = int(prob >= threshold)
+
+    plt.figure(figsize=(4, 4))
+    plt.imshow(img.numpy().astype("uint8"))
+    plt.title(
+        f"True: {class_names[true_label]} | Pred: {class_names[pred_label]} | Prob: {prob:.3f}"
+    )
+    plt.axis("off")
+    plt.show()
+    break
+
+"""## MIGT Dataset Splitting"""
+
+import os
+import cv2
+import numpy as np
+import shutil
+import random
+from sklearn.metrics import mutual_info_score
+from tqdm import tqdm
+
+# ===================== USER CONFIG =====================
+DATASET_ROOT = input("Enter dataset path (class folders inside): ").strip()
+OUTPUT_ROOT  = "/content/drive/MyDrive/DATASETS/MIGT-Brain-Tomur"
+
+CLASSES = ["Brain Tumor", "Healthy"]   # Folder names
+IMG_SIZE = (224, 224)
+
+START_BINS = 4
+MIN_SAMPLES_PER_BIN = 10
+
+TRAIN_RATIO = 0.5
+TEST_RATIO  = 0.4
+VAL_RATIO   = 0.1
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+# ======================================================
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def load_gray(path):
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    img = cv2.resize(img, IMG_SIZE)
+    return img
+
+
+def compute_mi(img1, img2, bins=64):
+    hist, _, _ = np.histogram2d(
+        img1.ravel(), img2.ravel(), bins=bins
+    )
+    return mutual_info_score(None, None, contingency=hist)
+
+
+# Create output folders
+for split in ["train", "test", "val"]:
+    for cls in CLASSES:
+        ensure_dir(os.path.join(OUTPUT_ROOT, split, cls))
+
+
+# ===================== MIGT PROCESS =====================
+for cls in CLASSES:
+    print(f"\nProcessing class: {cls}")
+    class_dir = os.path.join(DATASET_ROOT, cls)
+
+    images = [
+        os.path.join(class_dir, f)
+        for f in os.listdir(class_dir)
+        if f.lower().endswith((".jpg", ".png", ".jpeg"))
+    ]
+
+    images.sort()
+    assert len(images) > 0, f"No images found in {cls}"
+
+    # Reference image
+    ref_img = load_gray(images[0])
+
+    # Compute MI scores
+    mi_list = []
+    for img_path in tqdm(images, desc="Computing MI"):
+        img = load_gray(img_path)
+        mi = compute_mi(ref_img, img)
+        mi_list.append((img_path, mi))
+
+    # Sort by MI (ascending)
+    mi_list.sort(key=lambda x: x[1])
+
+    # ---------- Histogram-based binning ----------
+    num_bins = START_BINS
+    valid_bins = None
+
+    while num_bins >= 2:
+        bin_size = len(mi_list) // num_bins
+        bins = [
+            mi_list[i * bin_size:(i + 1) * bin_size]
+            for i in range(num_bins)
+        ]
+
+        if all(len(b) >= MIN_SAMPLES_PER_BIN for b in bins):
+            valid_bins = bins
+            print(f"Using {num_bins} MI bins")
+            break
+        num_bins -= 1
+
+    # ---------- Fallback: MI-only splitting ----------
+    if valid_bins is None:
+        print("Histogram dropped → Using MI-only 3-part split")
+        paths_sorted = [x[0] for x in mi_list]
+        total = len(paths_sorted)
+        part = total // 3
+
+        valid_bins = [
+            [(p, 0) for p in paths_sorted[:part]],
+            [(p, 0) for p in paths_sorted[part:2*part]],
+            [(p, 0) for p in paths_sorted[2*part:]],
+        ]
+
+    # ---------- Split each bin ----------
+    for bin_data in valid_bins:
+        paths = [x[0] for x in bin_data]
+        random.shuffle(paths)
+
+        n = len(paths)
+        n_train = int(TRAIN_RATIO * n)
+        n_test  = int(TEST_RATIO * n)
+
+        train = paths[:n_train]
+        test  = paths[n_train:n_train + n_test]
+        val   = paths[n_train + n_test:]
+
+        for p in train:
+            shutil.copy(p, os.path.join(OUTPUT_ROOT, "train", cls))
+        for p in test:
+            shutil.copy(p, os.path.join(OUTPUT_ROOT, "test", cls))
+        for p in val:
+            shutil.copy(p, os.path.join(OUTPUT_ROOT, "val", cls))
+
+print("\n✅ MIGT dataset splitting completed successfully.")
+
+"""## Train Model With MIGT"""
+
+# ============================================================
+# Brain Tumor Classification (Tumor vs Healthy) using Xception
+# Pretrained on ImageNet (Transfer Learning + Fine-Tuning)
+# - Google Drive dataset
+# - Train/Val/Test split using folder structure:
+#   BASE_DIR/
+#     train/Brain Tumor/...
+#     train/Healthy/...
+#     val/Brain Tumor/...
+#     val/Healthy/...
+#     test/Brain Tumor/...
+#     test/Healthy/...
+# - 100 epochs + EarlyStopping(patience=6)
+# - Adam optimizer
+# - Save base model + full model as .h5
+# - Plots: loss/accuracy curves
+# - Evaluation: confusion matrix, classification report, ROC/AUC
+# - One example prediction from test set
+# ============================================================
+
+# -------------------- Imports --------------------
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+
+# NOTE: Do not use seaborn (kept pure matplotlib for plots).
+# If you really want seaborn heatmap, you can add it later.
+
+# -------------------- Mount Google Drive --------------------
+from google.colab import drive
+drive.mount("/content/drive")
+
+# -------------------- Configuration --------------------
+BASE_DIR = "/content/drive/MyDrive/DATASETS/MIGT-Brain-Tomur"  # change if needed
+
+TRAIN_DIR = os.path.join(BASE_DIR, "train")
+VAL_DIR   = os.path.join(BASE_DIR, "val")
+TEST_DIR  = os.path.join(BASE_DIR, "test")
+
+IMG_SIZE = (224, 224)   # Xception expects 224x224
+BATCH_SIZE = 32
+EPOCHS = 100
+PATIENCE = 6
+SEED = 42
+
+# Fine-tuning config
+DO_FINE_TUNE = True
+FINE_TUNE_LAYERS = 30         # unfreeze last N layers of Xception
+HEAD_LR = 1e-3
+FINE_TUNE_LR = 1e-5
+FINE_TUNE_EPOCHS = 20         # additional epochs after head training
+
+# Model save paths (Drive)
+SAVE_DIR = "/content/drive/MyDrive/DATASETS/model-saved/MIGT-Save"
 os.makedirs(SAVE_DIR, exist_ok=True)
 BASE_MODEL_H5 = os.path.join(SAVE_DIR, "xception_base_model.h5")
 FULL_MODEL_H5 = os.path.join(SAVE_DIR, "xception_full_model.h5")
